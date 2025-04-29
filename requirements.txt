@@ -22,7 +22,7 @@ Flask==3.1.0
 Flask-SQLAlchemy==3.1.1
 frozenlist==1.5.0
 fsspec==2025.3.0
--e git+https://github.com/akashbisht004/health-genai.git@c6dbe0d66acf713fa74410a47c6b66b942a84a75#egg=Generative_ai_project
+-e git+https://github.com/akashbisht004/Med-bot.git#egg=Generative_ai_project\n
 googleapis-common-protos==1.69.1
 greenlet==3.1.1
 grpcio==1.71.0
