@@ -25,5 +25,5 @@ Welcome to the **Symptom Diagnosis Chatbot** project! This project uses a WhatsA
   - `SQLAlchemy`, `Pinecone`
 - **Utilities**: 
   - `Numpy`, `Pandas`, `Requests`, `Regex`
-  - 
+    
 
