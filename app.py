@@ -1,6 +1,6 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from twilio.twiml.messaging_response import MessagingResponse
+from flask_cors import CORS
 from langchain.chains import RetrievalQA
 from vector import docsearch
 import os
@@ -13,7 +13,7 @@ TOGETHER_API_KEY=os.getenv("TOGETHER_API_KEY")
 os.environ["TOGETHER_API_KEY"]=os.getenv("TOGETHER_API_KEY")
 
 app = Flask(__name__)
-
+CORS(app)  # Enable CORS for all routes
 
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -25,7 +25,7 @@ class User(db.Model):
     name = db.Column(db.String(100), nullable=False)
     age = db.Column(db.Integer, nullable=False)
     location = db.Column(db.String(100), nullable=False)
-    phone_number = db.Column(db.String(20), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
     conversation_state = db.Column(db.String(20), default="registration")  
 
 # RAG 
@@ -49,70 +49,74 @@ with app.app_context():
 # Initialize RAG chain
 qa_chain = initialize_rag()
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.form
-    phone_number = data.get("From").split(":")[-1]
-    message_body = data.get("Body").strip()
-
-    print(f"Extracted Phone: {phone_number}")
-    print(f"RAW Message Body: '{message_body}'")
-    resp = MessagingResponse()
-    user = User.query.filter_by(phone_number=phone_number).first()
-
-    if not user:
-        if "," in message_body:  
-            try:
-                name, age, location = [x.strip() for x in message_body.split(",")]
-                age = int(age)  
-                new_user = User(
-                    name=name, 
-                    age=age, 
-                    location=location, 
-                    phone_number=phone_number,
-                    conversation_state="ready"  
-                )
-                db.session.add(new_user)
-                db.session.commit()
-
-                print(f"User Added: {name}, {age}, {location}, {phone_number}")
-                resp.message(f"Thanks {name}! You're registered. Now send your medical question and I'll help you find an answer.")
-
-            except ValueError:
-                resp.message(" Invalid format! Send as: Name, Age, Location")
-        else:
-            resp.message("Welcome! Please send your details in this format:\nName, Age, Location")
-        
-        return str(resp)
-
-    if user.conversation_state == "ready":
-        try:
-            result = qa_chain.invoke({"query": message_body})
-            answer = result["result"]
-            sources = [doc.metadata.get("source", "Unknown") for doc in result["source_documents"]]
-            response_text = f"{answer}\n\nSources:\n" + "\n".join(sources[:2])  
-            if len(response_text) > 1500:
-                response_text = response_text[:1497] + "..."
-            resp.message(response_text)
-            
-        except Exception as e:
-            print(f"RAG ERROR: {str(e)}")
-            resp.message("I'm having trouble processing your question. Please try again or ask something else.")
-    else:
-        user.conversation_state = "ready"
+@app.route("/api/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    
+    if not all(k in data for k in ["name", "age", "location", "email"]):
+        return jsonify({"error": "Missing required fields"}), 400
+    
+    try:
+        age = int(data["age"])
+        new_user = User(
+            name=data["name"],
+            age=age,
+            location=data["location"],
+            email=data["email"],
+            conversation_state="ready"
+        )
+        db.session.add(new_user)
         db.session.commit()
-        resp.message(f"Hi {user.name}, what medical question can I help you with today?")
-    return str(resp)
+        
+        return jsonify({
+            "message": "Registration successful",
+            "user": {
+                "name": new_user.name,
+                "email": new_user.email
+            }
+        }), 201
+        
+    except ValueError:
+        return jsonify({"error": "Invalid age format"}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "Registration failed", "details": str(e)}), 400
 
-@app.route("/reset/<phone>", methods=["GET"])
-def reset_user(phone):
+@app.route("/api/query", methods=["POST"])
+def handle_query():
+    data = request.get_json()
+    
+    if not data or "query" not in data or "email" not in data:
+        return jsonify({"error": "Missing query or email"}), 400
+    
+    user = User.query.filter_by(email=data["email"]).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    try:
+        result = qa_chain.invoke({"query": data["query"]})
+        answer = result["result"]
+        sources = [doc.metadata.get("source", "Unknown") for doc in result["source_documents"]]
+        
+        response = {
+            "answer": answer,
+            "sources": sources[:2]
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({"error": "Failed to process query", "details": str(e)}), 500
+
+@app.route("/api/reset/<email>", methods=["DELETE"])
+def reset_user(email):
     """Admin endpoint to reset a user's state"""
-    user = User.query.filter_by(phone_number=phone).first()
+    user = User.query.filter_by(email=email).first()
     if user:
         db.session.delete(user)
         db.session.commit()
-        return f"User {phone} reset successfully"
-    return "User not found"
+        return jsonify({"message": f"User {email} reset successfully"}), 200
+    return jsonify({"error": "User not found"}), 404
 
 if __name__ == "__main__":
     app.run(debug=True) 
