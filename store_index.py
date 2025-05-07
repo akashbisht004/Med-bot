@@ -7,27 +7,29 @@ from langchain_pinecone import PineconeVectorStore
 
 load_dotenv()
 
-PINCONE_API_KEY=os.getenv('PINECONE_API_KEY')
+PINECONE_API_KEY=os.getenv('PINECONE_API_KEY')
 
 documents=loadPdf(data="./Data")
 texts=create_chunks(data=documents)
 embeddings=download_hf_embeddings()
 
-pc=Pinecone(api_key=PINCONE_API_KEY)
+pc=Pinecone(api_key=PINECONE_API_KEY)
 
 index_name="medbot"
 
-pc.create_index(
-    name=index_name,
-    dimension=384,
-    metric="cosine",
-    spec=ServerlessSpec(
-        cloud="aws",
-        region="us-east-1"
+# Check if index exists before creating
+if index_name not in pc.list_indexes().names():
+    pc.create_index(
+        name=index_name,
+        dimension=384,
+        metric="cosine",
+        spec=ServerlessSpec(
+            cloud="aws",
+            region="us-east-1"
+        )
     )
-)
 
-os.environ["PINECONE_API_KEY"]=PINCONE_API_KEY
+os.environ["PINECONE_API_KEY"]=PINECONE_API_KEY
 
 createVector=PineconeVectorStore.from_documents(
     documents=texts,
