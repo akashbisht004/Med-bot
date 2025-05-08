@@ -9,6 +9,8 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.schema.runnable import RunnablePassthrough
 from collections import defaultdict
 import re
+from doctor_recommender import DoctorRecommender
+import pandas as pd
 
 dotenv.load_dotenv()
 
@@ -20,6 +22,9 @@ CORS(app)
 
 # Store conversation history for each user
 conversation_history = defaultdict(list)
+
+# Initialize doctor recommender
+doctor_recommender = DoctorRecommender("Hospitaldata.xlsx")
 
 def load_patterns_from_file():
     """Load patterns and terms from patterns.txt file."""
@@ -81,38 +86,59 @@ def is_medical_query(query: str) -> bool:
     """Classify if a query is medical-related using a more sophisticated approach."""
     query_lower = query.lower()
     words = set(query_lower.split())
-    
+
+    # Always treat these as medical triggers
+    symptom_triggers = [
+        "symptom", "symptoms", "sign", "signs", "effect", "effects", "cause", "causes",
+        "treatment", "treatments", "cure", "cures", "diagnosis", "diagnose", "risk", "risks",
+        "what happens if", "what should i do if", "how do i know if", "how to treat", "how to cure",
+        "what are", "what is", "how to", "how do", "tell me about", "explain", "describe",
+        "common", "typical", "usual", "normal", "regular", "frequent", "often"
+    ]
+    for trigger in symptom_triggers:
+        if trigger in query_lower:
+            return True
+
     # Common medical conditions and diseases
     common_conditions = {
         'flu', 'cold', 'fever', 'covid', 'cancer', 'diabetes', 'asthma', 'arthritis',
         'hypertension', 'migraine', 'headache', 'allergy', 'infection', 'virus',
         'bacteria', 'disease', 'illness', 'condition', 'syndrome', 'scarlet', 'q fever',
-        'rheumatic', 'glomerulonephritis', 'measles', 'rash', 'sore throat'
+        'rheumatic', 'glomerulonephritis', 'measles', 'rash', 'sore throat', 'influenza',
+        'common cold', 'stomach flu', 'gastroenteritis', 'bronchitis', 'pneumonia',
+        'sinusitis', 'tonsillitis', 'ear infection', 'urinary tract infection'
     }
     
-    # Check for common medical conditions first
-    if any(condition in words for condition in common_conditions):
+    # Check for any condition in the query
+    if any(condition in query_lower for condition in common_conditions):
         return True
-    
-    # Check for medical context indicators
+
+    # Medical context words
     medical_context_words = {
         'doctor', 'hospital', 'clinic', 'medical', 'health', 'treatment', 
         'symptoms', 'disease', 'condition', 'patient', 'diagnosis', 'therapy',
         'medicine', 'medication', 'prescription', 'vaccine', 'vaccination',
-        'fever', 'pain', 'ache', 'swelling', 'rash', 'infection', 'virus',
-        'bacteria', 'disease', 'illness', 'symptom', 'treatment', 'medicine'
+        'pain', 'ache', 'swelling', 'rash', 'infection', 'virus', 'illness',
+        'sick', 'sickness', 'unwell', 'healthy', 'healthcare', 'medical care',
+        'prevent', 'prevention', 'cure', 'heal', 'healing', 'recover', 'recovery'
     }
-    has_medical_context = any(word in words for word in medical_context_words)
-    
-    # Count medical keywords in the query
+    if any(word in words for word in medical_context_words):
+        return True
+
+    # Check for question patterns about medical topics
+    question_patterns = [
+        r"what (are|is) .*(symptoms|signs|effects|causes|treatments|cures)",
+        r"how (do|does|can) .*(treat|cure|prevent|diagnose|heal)",
+        r"tell me about .*(symptoms|signs|effects|causes|treatments|cures)",
+        r"explain .*(symptoms|signs|effects|causes|treatments|cures)",
+        r"describe .*(symptoms|signs|effects|causes|treatments|cures)"
+    ]
+    if any(re.search(pattern, query_lower) for pattern in question_patterns):
+        return True
+
+    # Fallback: check for at least one medical keyword from your patterns
     medical_keyword_count = sum(1 for keyword in PATTERNS['MEDICAL_KEYWORDS'] if keyword.lower() in query_lower)
-    
-    # If query has explicit medical context or common condition, require fewer medical keywords
-    if has_medical_context:
-        return medical_keyword_count >= 1
-    
-    # If no explicit medical context, require more medical keywords to confirm it's medical
-    return medical_keyword_count >= 2
+    return medical_keyword_count >= 1
 
 def format_conversation_history(history):
     """Format conversation history for the prompt."""
@@ -232,6 +258,23 @@ def extract_medical_terms(query: str) -> list:
 # Initialize RAG chain
 qa_chain = initialize_rag()
 
+def extract_diagnosis_from_conversation(history: list) -> str:
+    """Extract the most recent diagnosis from conversation history."""
+    if not history:
+        return None
+        
+    # Look for diagnosis-related keywords in the last few messages
+    diagnosis_keywords = ['diagnosis', 'diagnosed', 'condition', 'disease', 'illness']
+    for message, response in reversed(history[-3:]):  # Check last 3 exchanges
+        for keyword in diagnosis_keywords:
+            if keyword in response.lower():
+                # Extract the sentence containing the diagnosis
+                sentences = response.split('.')
+                for sentence in sentences:
+                    if keyword in sentence.lower():
+                        return sentence.strip()
+    return None
+
 @app.route("/chat", methods=["POST"])
 def handle_query():
     data = request.get_json()
@@ -240,35 +283,57 @@ def handle_query():
         return jsonify({"error": "Missing message in request"}), 400
     
     try:
-        # Get session ID or use default
         session_id = data.get("session_id", "default")
         user_message = data["message"]
         
-        # First check if it's a medical query
         is_medical = is_medical_query(user_message)
         
         # If it's a medical query, process it regardless of jailbreak attempts
         if is_medical:
-            # Process the query using RAG
+            history = conversation_history.get(session_id, [])
+            
+            is_followup = False
+            if history:
+                last_user_msg, last_assistant_msg = history[-1]
+                followup_indicators = ['it', 'this', 'that', 'these', 'those', 'they', 'them']
+                words = user_message.lower().split()
+                if any(indicator in words for indicator in followup_indicators):
+                    is_followup = True
+                    user_message = f"{last_user_msg} {last_assistant_msg} {user_message}"
+            
             response = qa_chain.invoke({
                 "query": user_message,
                 "session_id": session_id
             })
             
-            # Only update conversation history if the response is not the default non-medical message
             non_medical_response = "I apologize, but I can only answer questions related to medical topics and healthcare. Please ask a medical-related question."
             if response != non_medical_response:
                 conversation_history[session_id].append((user_message, response))
+                
+                diagnosis = extract_diagnosis_from_conversation(conversation_history[session_id])
+                if diagnosis:
+                    # Get recommendations
+                    recommendations = doctor_recommender.get_recommendations(
+                        diagnosis=diagnosis
+                    )
+                    
+                    if recommendations['recommendations']:
+                        response += "\n\nBased on your diagnosis, here are some recommended healthcare providers:\n"
+                        
+                        for rec in recommendations['recommendations']:
+                            response += f"\nHospital: {rec['hospital_name']}"
+                            response += f"\nDoctor: {rec['doctor']}"
+                            if pd.notna(rec['category']):
+                                response += f"\nSpecialization: {rec['category']}"
+                            response += f"\nContact: {rec['contact']}\n"
             
             return jsonify({"response": response})
         
-        # If it's not a medical query, check for jailbreak attempts
         if check_jailbreak_attempt(user_message):
             return jsonify({
                 "response": "I apologize, but I can only answer questions related to medical topics and healthcare. Please ask a medical-related question."
             }), 200
             
-        # If it's not a medical query and not a jailbreak attempt
         return jsonify({
             "response": "I apologize, but I can only answer questions related to medical topics and healthcare. Please ask a medical-related question."
         }), 200
